@@ -356,6 +356,76 @@ class ToolExecutor {
     }
 
     /**
+     * Progressive variant of {@link #executeAll}: emits each tool result as soon as
+     * the tool completes, without waiting for all tools to finish.
+     *
+     * <p>The concurrency partitioning logic is identical to {@link #executeAll}:
+     * concurrency-safe tools run in parallel batches (order preserved via
+     * mergeSequential), unsafe tools get their own serial slot. The only
+     * difference is that {@code .collectList()} is omitted so each result is
+     * delivered immediately.
+     *
+     * <p>Individual tool failures do not terminate the stream:
+     * {@link #executeWithInfrastructure} already wraps each tool in
+     * {@code onErrorResume → ToolResultBlock.error(...)}, so a failed tool
+     * produces an error result rather than propagating an exception.
+     *
+     * @param toolCalls List of tool calls to execute
+     * @param parallel Whether to execute in parallel
+     * @param executionConfig Execution configuration
+     * @param agent The agent making the calls (may be null)
+     * @param agentRuntimeContext The agent-level runtime context (may be null)
+     * @return Flux emitting each tool result as it completes
+     */
+    Flux<ToolResultBlock> executeAllProgressive(
+            List<ToolUseBlock> toolCalls,
+            boolean parallel,
+            ExecutionConfig executionConfig,
+            Agent agent,
+            io.agentscope.core.agent.RuntimeContext agentRuntimeContext) {
+        if (toolCalls == null || toolCalls.isEmpty()) {
+            return Flux.empty();
+        }
+
+        logger.debug("Progressive {} tool calls (parallel={})", toolCalls.size(), parallel);
+
+        if (!parallel) {
+            List<Mono<ToolResultBlock>> monos =
+                    toolCalls.stream()
+                            .map(
+                                    toolCall ->
+                                            executeWithInfrastructure(
+                                                    toolCall,
+                                                    executionConfig,
+                                                    agent,
+                                                    agentRuntimeContext))
+                            .toList();
+            return Flux.concat(monos);
+        }
+
+        List<Flux<ToolResultBlock>> chunks = new ArrayList<>();
+        List<Mono<ToolResultBlock>> safeBatch = new ArrayList<>();
+        for (ToolUseBlock toolCall : toolCalls) {
+            Mono<ToolResultBlock> mono =
+                    executeWithInfrastructure(
+                            toolCall, executionConfig, agent, agentRuntimeContext);
+            if (isConcurrencySafe(toolCall)) {
+                safeBatch.add(mono);
+            } else {
+                if (!safeBatch.isEmpty()) {
+                    chunks.add(Flux.mergeSequential(safeBatch));
+                    safeBatch = new ArrayList<>();
+                }
+                chunks.add(mono.flux());
+            }
+        }
+        if (!safeBatch.isEmpty()) {
+            chunks.add(Flux.mergeSequential(safeBatch));
+        }
+        return Flux.concat(chunks);
+    }
+
+    /**
      * Whether the tool backing {@code toolCall} can run in parallel with itself. Defaults to
      * {@code true} for legacy {@link AgentTool} instances that do not extend {@link ToolBase}, so
      * existing tools keep their pre-2.0 concurrent behaviour.

@@ -32,6 +32,7 @@ import java.util.Set;
 import java.util.function.BiConsumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /**
@@ -491,6 +492,10 @@ public class Toolkit {
         return executor.execute(param);
     }
 
+    public ToolkitConfig getConfig() {
+        return config;
+    }
+
     /**
      * Execute multiple tools asynchronously with agent-level context (internal use by
      * ReActAgent).
@@ -521,6 +526,35 @@ public class Toolkit {
                                 config.getExecutionConfig(), ExecutionConfig.TOOL_DEFAULTS));
 
         return executor.executeAll(
+                toolCalls, config.isParallel(), effectiveConfig, agent, agentRuntimeContext);
+    }
+
+    /**
+     * Execute multiple tools in progressive mode: each tool result is emitted as
+     * soon as the tool completes, without waiting for all tools to finish.
+     *
+     * <p>This is the progressive counterpart of {@link #callTools}. The concurrency
+     * partitioning is identical; the only difference is that results are emitted
+     * individually via {@link Flux} instead of collected into a list.
+     *
+     * @param toolCalls List of tool calls to execute
+     * @param agentExecutionConfig Execution config from the agent (may be null)
+     * @param agent The agent making the calls (may be null)
+     * @param agentRuntimeContext The agent-level runtime context (may be null)
+     * @return Flux emitting each tool result as it completes
+     */
+    public Flux<ToolResultBlock> callToolsProgressive(
+            List<ToolUseBlock> toolCalls,
+            ExecutionConfig agentExecutionConfig,
+            Agent agent,
+            io.agentscope.core.agent.RuntimeContext agentRuntimeContext) {
+        ExecutionConfig effectiveConfig =
+                ExecutionConfig.mergeConfigs(
+                        agentExecutionConfig,
+                        ExecutionConfig.mergeConfigs(
+                                config.getExecutionConfig(), ExecutionConfig.TOOL_DEFAULTS));
+
+        return executor.executeAllProgressive(
                 toolCalls, config.isParallel(), effectiveConfig, agent, agentRuntimeContext);
     }
 

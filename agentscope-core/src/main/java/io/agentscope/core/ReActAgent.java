@@ -133,9 +133,11 @@ import io.agentscope.core.util.JsonUtils;
 import io.agentscope.core.util.MessageUtils;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -3028,6 +3030,104 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                                     .subscribe();
                                                         });
 
+                                                boolean progressive =
+                                                        toolkit.getConfig()
+                                                                .isProgressiveToolResults();
+                                                if (progressive) {
+                                                    List<Map.Entry<ToolUseBlock, ToolResultBlock>>
+                                                            progressiveAccumulated =
+                                                                    Collections.synchronizedList(
+                                                                            new ArrayList<
+                                                                                    Map.Entry<
+                                                                                            ToolUseBlock,
+                                                                                            ToolResultBlock>>(
+                                                                                    deniedEntries));
+                                                    Disposable progressiveDisposable =
+                                                            executeToolCallsProgressive(approved)
+                                                                    .contextWrite(
+                                                                            ctx -> {
+                                                                                Context merged =
+                                                                                        ctx.putAll(
+                                                                                                parentCtx);
+                                                                                if (!merged.hasKey(
+                                                                                                SubagentEventBus
+                                                                                                        .CONTEXT_KEY)
+                                                                                        && !merged
+                                                                                                .hasKey(
+                                                                                                        AgentEventEmitter
+                                                                                                                .CONTEXT_KEY)) {
+                                                                                    if (eventSink
+                                                                                            != null) {
+                                                                                        merged =
+                                                                                                merged
+                                                                                                        .put(
+                                                                                                                AgentEventEmitter
+                                                                                                                        .CONTEXT_KEY,
+                                                                                                                (AgentEventEmitter)
+                                                                                                                        eventSink
+                                                                                                                                ::next);
+                                                                                    } else if (externalEventEmitter
+                                                                                            != null) {
+                                                                                        merged =
+                                                                                                merged
+                                                                                                        .put(
+                                                                                                                AgentEventEmitter
+                                                                                                                        .CONTEXT_KEY,
+                                                                                                                externalEventEmitter);
+                                                                                    }
+                                                                                }
+                                                                                return merged;
+                                                                            })
+                                                                    .subscribe(
+                                                                            entry -> {
+                                                                                progressiveAccumulated
+                                                                                        .add(entry);
+                                                                                emitToolResultDelta(
+                                                                                        sink,
+                                                                                        replyId,
+                                                                                        entry,
+                                                                                        chunkedToolIds);
+                                                                                ToolResultState
+                                                                                        state =
+                                                                                                determineToolResultState(
+                                                                                                        entry
+                                                                                                                .getValue());
+                                                                                sink.next(
+                                                                                        new ToolResultEndEvent(
+                                                                                                        replyId,
+                                                                                                        entry.getKey()
+                                                                                                                .getId(),
+                                                                                                        entry.getKey()
+                                                                                                                .getName(),
+                                                                                                        state)
+                                                                                                .withMetadata(
+                                                                                                        entry.getValue()
+                                                                                                                .getMetadata()));
+                                                                            },
+                                                                            sink::error,
+                                                                            () -> {
+                                                                                resultHolder.set(
+                                                                                        progressiveAccumulated);
+                                                                                List<ToolUseBlock>
+                                                                                        suspendedCalls =
+                                                                                                getSuspendedToolCalls(
+                                                                                                        progressiveAccumulated);
+                                                                                if (!suspendedCalls
+                                                                                        .isEmpty()) {
+                                                                                    persistPendingRequestReplyId(
+                                                                                            Msg
+                                                                                                    .METADATA_EXTERNAL_EXECUTION_REQUEST_REPLY_ID,
+                                                                                            replyId);
+                                                                                    sink.next(
+                                                                                            new RequireExternalExecutionEvent(
+                                                                                                    replyId,
+                                                                                                    suspendedCalls));
+                                                                                }
+                                                                                sink.complete();
+                                                                            });
+                                                    sink.onCancel(progressiveDisposable);
+                                                    return;
+                                                }
                                                 Disposable toolCallsDisposable =
                                                         executeToolCalls(approved)
                                                                 .contextWrite(
@@ -3369,6 +3469,61 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                         })
                                                 .toList();
                                 return Mono.just(errorResults);
+                            });
+        }
+
+        /**
+         * Progressive variant of {@link #executeToolCalls}: emits each (ToolUseBlock,
+         * ToolResultBlock) pair as soon as the individual tool completes, instead of
+         * waiting for all tools to finish.
+         *
+         * <p>When structured output is present, this method falls back to the batch
+         * path ({@link #executeToolCalls}) because structured-output assembly is
+         * position-aware and cannot be streamed incrementally.
+         *
+         * <p>Individual tool failures are handled per-tool by
+         * {@link ToolExecutor#executeWithInfrastructure}: each failed tool produces
+         * an error {@link ToolResultBlock} rather than propagating an exception, so
+         * the stream is not terminated by a single tool's failure.
+         *
+         * @param toolCalls the tool calls to execute
+         * @return Flux emitting (ToolUseBlock, ToolResultBlock) pairs as each tool completes
+         */
+        private Flux<Map.Entry<ToolUseBlock, ToolResultBlock>> executeToolCallsProgressive(
+                List<ToolUseBlock> toolCalls) {
+            boolean hasStructured =
+                    soTool != null
+                            && toolCalls.stream()
+                                    .anyMatch(t -> STRUCTURED_OUTPUT_TOOL_NAME.equals(t.getName()));
+
+            if (hasStructured) {
+                // Structured output requires position-aware assembly; fall back to batch path.
+                return executeToolCalls(toolCalls).flatMapMany(Flux::fromIterable);
+            }
+
+            // Build an id → ToolUseBlock lookup so each streamed result can be paired
+            // with its originating tool call regardless of completion order.
+            Map<String, ToolUseBlock> byId = new LinkedHashMap<>();
+            for (ToolUseBlock tc : toolCalls) {
+                byId.put(tc.getId(), tc);
+            }
+
+            return toolkit.callToolsProgressive(
+                            toolCalls,
+                            toolExecutionConfig,
+                            ReActAgent.this,
+                            buildMergedRuntimeContext(rc))
+                    .map(
+                            result -> {
+                                ToolUseBlock use = byId.get(result.getId());
+                                if (use == null) {
+                                    use =
+                                            ToolUseBlock.builder()
+                                                    .id(result.getId())
+                                                    .name(result.getName())
+                                                    .build();
+                                }
+                                return Map.entry(use, result);
                             });
         }
 

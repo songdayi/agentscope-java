@@ -33,6 +33,7 @@ import java.util.concurrent.ExecutorService;
 public class ToolkitConfig {
 
     private final boolean parallel;
+    private final boolean progressiveToolResults;
     private final ExecutorService executorService;
     private final ExecutionConfig executionConfig;
     private final boolean allowToolDeletion;
@@ -40,6 +41,7 @@ public class ToolkitConfig {
 
     private ToolkitConfig(Builder builder) {
         this.parallel = builder.parallel;
+        this.progressiveToolResults = builder.progressiveToolResults;
         this.executorService = builder.executorService;
         this.executionConfig = builder.executionConfig;
         this.allowToolDeletion = builder.allowToolDeletion;
@@ -53,6 +55,21 @@ public class ToolkitConfig {
      */
     public boolean isParallel() {
         return parallel;
+    }
+
+    /**
+     * Whether tool results should be streamed individually as each tool completes,
+     * rather than waiting for all tools to finish before emitting results.
+     *
+     * <p>When enabled, each tool's {@code ToolResultEndEvent} is sent immediately
+     * upon completion, so downstream consumers (SSE, event pipeline) see per-tool
+     * completion as it happens. When disabled (default), all results are collected
+     * and delivered together after every tool finishes.
+     *
+     * @return true if progressive tool results is enabled
+     */
+    public boolean isProgressiveToolResults() {
+        return progressiveToolResults;
     }
 
     /**
@@ -125,6 +142,7 @@ public class ToolkitConfig {
      */
     public static class Builder {
         private boolean parallel = true;
+        private boolean progressiveToolResults = false;
         private ExecutorService executorService;
         private ExecutionConfig executionConfig;
         private boolean allowToolDeletion = true;
@@ -140,6 +158,22 @@ public class ToolkitConfig {
          */
         public Builder parallel(boolean parallel) {
             this.parallel = parallel;
+            return this;
+        }
+
+        /**
+         * Set whether to stream tool results individually as each tool completes.
+         *
+         * <p>When enabled, {@code ToolResultEndEvent} for each tool is emitted
+         * immediately upon that tool's completion, instead of waiting for all
+         * tools to finish. This allows downstream consumers to observe per-tool
+         * completion timing and display results progressively.
+         *
+         * @param progressiveToolResults true to enable per-tool progressive delivery, false for batch delivery
+         * @return this builder
+         */
+        public Builder progressiveToolResults(boolean progressiveToolResults) {
+            this.progressiveToolResults = progressiveToolResults;
             return this;
         }
 
